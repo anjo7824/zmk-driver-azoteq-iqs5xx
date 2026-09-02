@@ -566,12 +566,6 @@ static int iqs5xx_init(const struct device *dev) {
         return ret;
     }
 
-    ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_RISING);
-    if (ret < 0) {
-        LOG_ERR("Failed to configure RDY interrupt: %d", ret);
-        return ret;
-    }
-
     // Wait for device to be ready.
     k_msleep(100);
 
@@ -582,6 +576,12 @@ static int iqs5xx_init(const struct device *dev) {
     // causing the first I2C write to fail (NACK/timeout). Retry a few times
     // before giving up, instead of leaving the chip on its previous/factory
     // gesture configuration while we still process its interrupts.
+    //
+    // The RDY interrupt is deliberately not armed yet: iqs5xx_work_handler()
+    // does its own I2C reads/writes to this device, and running that
+    // concurrently with the sequence below (from an early stray RDY pulse)
+    // corrupts the chip's communication-window state, breaking every I2C
+    // transaction afterwards until it's power-cycled.
     for (int attempt = 1; attempt <= 5; attempt++) {
         ret = iqs5xx_setup_device(dev);
         if (ret == 0) {
@@ -592,10 +592,14 @@ static int iqs5xx_init(const struct device *dev) {
     }
     if (ret < 0) {
         LOG_ERR("Failed to setup device: %d", ret);
-        // The chip may be running with a gesture configuration we never
-        // managed to apply (its own previous state or factory defaults).
-        // Don't keep processing its interrupts against that unknown config.
-        gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_DISABLE);
+        return ret;
+    }
+
+    // Only now is it safe to let iqs5xx_work_handler() start talking to the
+    // device on its own.
+    ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_RISING);
+    if (ret < 0) {
+        LOG_ERR("Failed to configure RDY interrupt: %d", ret);
         return ret;
     }
 
