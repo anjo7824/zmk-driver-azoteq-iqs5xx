@@ -22,6 +22,7 @@ Feel free to send a pull request if you test with any of the following models:
 - Single finger tap: Reported as a left click.
 - Two finger tap: Reported as a right click.
 - Press and hold: Reported as a continuos left click (allows click and drag).
+- Tap-and-hold: Tap, lift, then hold or move to start a drag (left click held down), like "tap to drag" on laptop trackpads. Doesn't interfere with single or double click.
 - Vertical scroll.
 - Horizontal scroll.
 
@@ -56,6 +57,9 @@ Feel free to send a pull request if you test with any of the following models:
         press-and-hold;
         press-and-hold-time = <250>;
         two-finger-tap;
+
+        tap-and-hold;
+        tap-and-hold-release-timeout-ms = <500>;
 
         scroll;
         natural-scroll-y;

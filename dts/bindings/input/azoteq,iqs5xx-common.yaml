@@ -20,6 +20,21 @@ properties:
     description: "Time in ms (in addition to the tap time) it takes to register a press and hold gesture"
     default: 250
 
+  tap-and-hold:
+    type: boolean
+    description: |
+      Register a tap, lift, then hold (or move) gesture as a left click held
+      down until released, similar to "tap to drag" on laptop trackpads.
+      A plain single tap still reports a normal click, and a quick second
+      tap still reports a double click; this only starts a drag when the
+      second touch is held in place or moved. Implies one-finger-tap
+      gesture detection on the device even if one-finger-tap is not set.
+
+  tap-and-hold-release-timeout-ms:
+    type: int
+    description: "Grace period in ms after lifting the finger during a drag before the drag is released. Touching down again within this window continues the drag."
+    default: 500
+
   two-finger-tap:
     type: boolean
     description: "Register two finger tap gestures and report them as a right click"

@@ -122,6 +122,10 @@ struct iqs5xx_config {
     bool two_finger_tap;
     uint16_t press_and_hold_time;
 
+    // Tap-and-hold configuration (tap, lift, then hold or move to drag).
+    bool tap_and_hold;
+    uint16_t tap_and_hold_release_timeout_ms;
+
     // Scrolling configuration.
     bool scroll;
     bool natural_scroll_x;
@@ -147,6 +151,24 @@ struct iqs5xx_data {
     // Flag to indicate if the button was pressed in a previous cycle.
     uint8_t buttons_pressed;
     bool active_hold;
+
+    // Tap-and-hold drag gesture state (tap, lift, then hold or move to drag).
+    struct k_work_delayable tap_hold_click_work;
+    struct k_work_delayable tap_hold_start_work;
+    struct k_work_delayable tap_hold_release_work;
+    bool is_touching;
+    // First tap completed, waiting to see if a second touch lands in time.
+    bool tap_hold_awaiting_second_touch;
+    // Second touch is down, waiting to see if it becomes a hold or a quick release.
+    bool tap_hold_second_touch_down;
+    // Drag is active: the left button is being held down.
+    bool active_tap_hold;
+    // Finger lifted during a drag; a delayed release is scheduled unless it comes back.
+    bool tap_hold_release_pending;
+    // Movement accumulated since the second touch went down.
+    int16_t tap_hold_move_x;
+    int16_t tap_hold_move_y;
+
     // Scroll accumulators.
     int16_t scroll_x_acc;
     int16_t scroll_y_acc;

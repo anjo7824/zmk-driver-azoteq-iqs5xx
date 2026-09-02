@@ -18,6 +18,15 @@
 
 LOG_MODULE_REGISTER(iqs5xx, CONFIG_INPUT_LOG_LEVEL);
 
+// Tap-and-hold (tap, lift, then hold or move) drag gesture timing.
+// TODO: Expose these through Kconfig/dts, similar to press_and_hold_time.
+// Max time after a tap release to see a second touch-down.
+#define IQS5XX_TAP_HOLD_WINDOW_MS 150
+// How long the second touch must stay down before the drag starts.
+#define IQS5XX_TAP_HOLD_START_MS 200
+// Movement (raw counts) during the second touch that starts the drag immediately.
+#define IQS5XX_TAP_HOLD_MOVE_DISTANCE 20
+
 static int iqs5xx_read_reg16(const struct device *dev, uint16_t reg, uint16_t *val) {
     const struct iqs5xx_config *config = dev->config;
     uint8_t buf[2];
@@ -78,6 +87,149 @@ static void iqs5xx_button_release_work_handler(struct k_work *work) {
     }
 }
 
+static void iqs5xx_start_tap_hold_drag(struct iqs5xx_data *data) {
+    if (data->active_tap_hold) {
+        return;
+    }
+
+    if (data->tap_hold_release_pending) {
+        k_work_cancel_delayable(&data->tap_hold_release_work);
+        data->tap_hold_release_pending = false;
+    }
+
+    data->tap_hold_second_touch_down = false;
+    data->tap_hold_awaiting_second_touch = false;
+    // Owned entirely by active_tap_hold/the release-grace timer below, not by
+    // buttons_pressed/button_release_work, so an unrelated tap's delayed
+    // release can never end the drag early.
+    input_report_key(data->dev, LEFT_BUTTON_CODE, 1, true, K_FOREVER);
+    data->active_tap_hold = true;
+    LOG_INF("Tap-and-hold drag started");
+}
+
+static void iqs5xx_tap_hold_click_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs5xx_data *data = CONTAINER_OF(dwork, struct iqs5xx_data, tap_hold_click_work);
+
+    if (!data->tap_hold_awaiting_second_touch) {
+        return;
+    }
+    data->tap_hold_awaiting_second_touch = false;
+
+    // No second touch arrived in time: this was a plain single click.
+    k_work_cancel_delayable(&data->button_release_work);
+    input_report_key(data->dev, LEFT_BUTTON_CODE, 1, true, K_FOREVER);
+    data->buttons_pressed |= LEFT_BUTTON_BIT;
+    k_work_schedule(&data->button_release_work, K_MSEC(100));
+}
+
+static void iqs5xx_tap_hold_start_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs5xx_data *data = CONTAINER_OF(dwork, struct iqs5xx_data, tap_hold_start_work);
+
+    if (!data->tap_hold_second_touch_down || !data->is_touching) {
+        data->tap_hold_second_touch_down = false;
+        return;
+    }
+
+    iqs5xx_start_tap_hold_drag(data);
+}
+
+static void iqs5xx_tap_hold_release_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs5xx_data *data = CONTAINER_OF(dwork, struct iqs5xx_data, tap_hold_release_work);
+
+    data->tap_hold_release_pending = false;
+
+    if (!data->active_tap_hold || data->is_touching) {
+        // Touch resumed before the timeout fired; iqs5xx_handle_tap_and_hold()
+        // already canceled this work in that case, but guard against races.
+        return;
+    }
+
+    data->active_tap_hold = false;
+    input_report_key(data->dev, LEFT_BUTTON_CODE, 0, true, K_FOREVER);
+    LOG_INF("Tap-and-hold drag released");
+}
+
+// Runs the tap-and-hold ("tap, lift, then hold or move to drag") state machine.
+// rel_x/rel_y are only read when tp_movement is set and must only be used then.
+static void iqs5xx_handle_tap_and_hold(const struct device *dev, struct iqs5xx_data *data,
+                                       const struct iqs5xx_config *config, bool single_tap,
+                                       bool touch_down, bool touch_up, bool tp_movement,
+                                       int16_t rel_x, int16_t rel_y) {
+    // A fast swipe on the second touch should start the drag immediately
+    // instead of waiting for the hold timer.
+    if (data->tap_hold_second_touch_down && tp_movement) {
+        data->tap_hold_move_x += rel_x;
+        data->tap_hold_move_y += rel_y;
+        if (abs(data->tap_hold_move_x) + abs(data->tap_hold_move_y) >=
+            IQS5XX_TAP_HOLD_MOVE_DISTANCE) {
+            k_work_cancel_delayable(&data->tap_hold_start_work);
+            iqs5xx_start_tap_hold_drag(data);
+        }
+    }
+
+    if (touch_down) {
+        if (data->tap_hold_awaiting_second_touch) {
+            // A second touch landed inside the click window: this might
+            // become a double click or a drag, not a plain single click.
+            k_work_cancel_delayable(&data->tap_hold_click_work);
+            data->tap_hold_awaiting_second_touch = false;
+            data->tap_hold_second_touch_down = true;
+            data->tap_hold_move_x = 0;
+            data->tap_hold_move_y = 0;
+            k_work_schedule(&data->tap_hold_start_work, K_MSEC(IQS5XX_TAP_HOLD_START_MS));
+        } else if (data->active_tap_hold && data->tap_hold_release_pending) {
+            // Touch resumed before the release grace period elapsed: keep dragging.
+            k_work_cancel_delayable(&data->tap_hold_release_work);
+            data->tap_hold_release_pending = false;
+        }
+    }
+
+    if (single_tap) {
+        if (data->tap_hold_second_touch_down) {
+            // The second touch was released quickly, without holding or
+            // moving far enough to become a drag: report it as a double click.
+            k_work_cancel_delayable(&data->tap_hold_start_work);
+            data->tap_hold_second_touch_down = false;
+            k_work_cancel_delayable(&data->button_release_work);
+            input_report_key(dev, LEFT_BUTTON_CODE, 1, true, K_FOREVER);
+            input_report_key(dev, LEFT_BUTTON_CODE, 0, true, K_FOREVER);
+            input_report_key(dev, LEFT_BUTTON_CODE, 1, true, K_FOREVER);
+            data->buttons_pressed |= LEFT_BUTTON_BIT;
+            k_work_schedule(&data->button_release_work, K_MSEC(100));
+        } else if (!data->active_tap_hold) {
+            // First tap of a possible sequence: wait to see if a second
+            // touch lands before treating it as a plain single click.
+            data->tap_hold_awaiting_second_touch = true;
+            k_work_schedule(&data->tap_hold_click_work, K_MSEC(IQS5XX_TAP_HOLD_WINDOW_MS));
+        }
+    }
+
+    if (touch_up && data->active_tap_hold && !data->tap_hold_release_pending) {
+        data->tap_hold_release_pending = true;
+        k_work_schedule(&data->tap_hold_release_work,
+                        K_MSEC(config->tap_and_hold_release_timeout_ms));
+    }
+}
+
+static void iqs5xx_reset_tap_and_hold_state(struct iqs5xx_data *data) {
+    k_work_cancel_delayable(&data->tap_hold_click_work);
+    k_work_cancel_delayable(&data->tap_hold_start_work);
+    k_work_cancel_delayable(&data->tap_hold_release_work);
+
+    if (data->active_tap_hold) {
+        input_report_key(data->dev, LEFT_BUTTON_CODE, 0, true, K_FOREVER);
+    }
+
+    data->is_touching = false;
+    data->tap_hold_awaiting_second_touch = false;
+    data->tap_hold_second_touch_down = false;
+    data->active_tap_hold = false;
+    data->tap_hold_release_pending = false;
+}
+
 static void iqs5xx_work_handler(struct k_work *work) {
     struct iqs5xx_data *data = CONTAINER_OF(work, struct iqs5xx_data, work);
     const struct device *dev = data->dev;
@@ -115,6 +267,7 @@ static void iqs5xx_work_handler(struct k_work *work) {
         LOG_INF("Device reset detected");
         // Acknowledge reset.
         iqs5xx_write_reg8(dev, IQS5XX_SYSTEM_CONTROL_0, IQS5XX_ACK_RESET);
+        iqs5xx_reset_tap_and_hold_state(data);
         goto end_comm;
     }
 
@@ -126,9 +279,26 @@ static void iqs5xx_work_handler(struct k_work *work) {
         data->scroll_y_acc = 0;
     }
 
+    // Touch state, used by the tap-and-hold drag gesture below.
+    bool touch_down = false;
+    bool touch_up = false;
+    if (config->tap_and_hold) {
+        ret = iqs5xx_read_reg8(dev, IQS5XX_NUM_FINGERS, &num_fingers);
+        if (ret < 0) {
+            LOG_ERR("Failed to read number of fingers: %d", ret);
+            goto end_comm;
+        }
+
+        bool is_touching = num_fingers > 0;
+        touch_down = is_touching && !data->is_touching;
+        touch_up = !is_touching && data->is_touching;
+        data->is_touching = is_touching;
+    }
+
     uint16_t button_code;
     bool button_pressed = false;
-    if (gesture_events_0 & IQS5XX_SINGLE_TAP) {
+    bool single_tap = (gesture_events_0 & IQS5XX_SINGLE_TAP) != 0;
+    if (single_tap && !config->tap_and_hold) {
         button_pressed = true;
         button_code = INPUT_BTN_0;
     } else if (gesture_events_1 & IQS5XX_TWO_FINGER_TAP) {
@@ -139,7 +309,7 @@ static void iqs5xx_work_handler(struct k_work *work) {
     bool hold_became_active = (gesture_events_0 & IQS5XX_PRESS_AND_HOLD) && !data->active_hold;
     bool hold_released = !(gesture_events_0 & IQS5XX_PRESS_AND_HOLD) && data->active_hold;
 
-    int16_t rel_x, rel_y;
+    int16_t rel_x = 0, rel_y = 0;
     if (tp_movement || scroll) {
         ret = iqs5xx_read_reg16(dev, IQS5XX_REL_X, (uint16_t *)&rel_x);
         if (ret < 0) {
@@ -152,6 +322,11 @@ static void iqs5xx_work_handler(struct k_work *work) {
             LOG_ERR("Failed to read relative Y: %d", ret);
             goto end_comm;
         }
+    }
+
+    if (config->tap_and_hold) {
+        iqs5xx_handle_tap_and_hold(dev, data, config, single_tap, touch_down, touch_up,
+                                   tp_movement, rel_x, rel_y);
     }
 
     // Handle movement and gestures.
@@ -209,12 +384,6 @@ static void iqs5xx_work_handler(struct k_work *work) {
             goto end_comm;
         }
     } else if (tp_movement) {
-        ret = iqs5xx_read_reg8(dev, IQS5XX_NUM_FINGERS, &num_fingers);
-        if (ret < 0) {
-            LOG_ERR("Failed to read number of fingers: %d", ret);
-            goto end_comm;
-        }
-
         if (rel_x != 0 || rel_y != 0) {
             input_report_rel(dev, INPUT_REL_X, rel_x, false, K_FOREVER);
             input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_FOREVER);
@@ -271,7 +440,9 @@ static int iqs5xx_setup_device(const struct device *dev) {
     }
 
     uint8_t single_finger_gestures = 0;
-    single_finger_gestures |= config->one_finger_tap ? IQS5XX_SINGLE_TAP : 0;
+    // tap-and-hold is built on top of the single tap gesture: it needs the
+    // chip to report single taps even if one-finger-tap itself isn't set.
+    single_finger_gestures |= (config->one_finger_tap || config->tap_and_hold) ? IQS5XX_SINGLE_TAP : 0;
     single_finger_gestures |= config->press_and_hold ? IQS5XX_PRESS_AND_HOLD : 0;
     // Configure single finger gestures.
     ret = iqs5xx_write_reg8(dev, IQS5XX_SINGLE_FINGER_GESTURES_CONF, single_finger_gestures);
@@ -338,6 +509,9 @@ static int iqs5xx_init(const struct device *dev) {
     data->dev = dev;
     k_work_init(&data->work, iqs5xx_work_handler);
     k_work_init_delayable(&data->button_release_work, iqs5xx_button_release_work_handler);
+    k_work_init_delayable(&data->tap_hold_click_work, iqs5xx_tap_hold_click_work_handler);
+    k_work_init_delayable(&data->tap_hold_start_work, iqs5xx_tap_hold_start_work_handler);
+    k_work_init_delayable(&data->tap_hold_release_work, iqs5xx_tap_hold_release_work_handler);
 
     // Configure reset GPIO if available.
     if (config->reset_gpio.port) {
@@ -414,6 +588,9 @@ static int iqs5xx_init(const struct device *dev) {
         .natural_scroll_x = DT_INST_PROP(n, natural_scroll_x),                                     \
         .natural_scroll_y = DT_INST_PROP(n, natural_scroll_y),                                     \
         .press_and_hold_time = DT_INST_PROP_OR(n, press_and_hold_time, 250),                       \
+        .tap_and_hold = DT_INST_PROP(n, tap_and_hold),                                             \
+        .tap_and_hold_release_timeout_ms =                                                         \
+            DT_INST_PROP_OR(n, tap_and_hold_release_timeout_ms, 500),                              \
         .switch_xy = DT_INST_PROP(n, switch_xy),                                                   \
         .flip_x = DT_INST_PROP(n, flip_x),                                                         \
         .flip_y = DT_INST_PROP(n, flip_y),                                                         \
