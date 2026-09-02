@@ -444,11 +444,25 @@ static int iqs5xx_setup_device(const struct device *dev) {
     // chip to report single taps even if one-finger-tap itself isn't set.
     single_finger_gestures |= (config->one_finger_tap || config->tap_and_hold) ? IQS5XX_SINGLE_TAP : 0;
     single_finger_gestures |= config->press_and_hold ? IQS5XX_PRESS_AND_HOLD : 0;
+    LOG_INF("Single finger gestures: computed=0x%02x (one_finger_tap=%d press_and_hold=%d "
+            "tap_and_hold=%d)",
+            single_finger_gestures, config->one_finger_tap, config->press_and_hold,
+            config->tap_and_hold);
     // Configure single finger gestures.
     ret = iqs5xx_write_reg8(dev, IQS5XX_SINGLE_FINGER_GESTURES_CONF, single_finger_gestures);
     if (ret < 0) {
         LOG_ERR("Failed to configure single finger gestures: %d", ret);
         return ret;
+    }
+
+    // Diagnostic readback: confirms whether the write above actually stuck.
+    uint8_t single_finger_gestures_readback = 0;
+    ret = iqs5xx_read_reg8(dev, IQS5XX_SINGLE_FINGER_GESTURES_CONF,
+                           &single_finger_gestures_readback);
+    if (ret < 0) {
+        LOG_ERR("Failed to read back single finger gestures: %d", ret);
+    } else {
+        LOG_INF("Single finger gestures readback: 0x%02x", single_finger_gestures_readback);
     }
 
     // Configure the hold time for the press and hold gesture.
