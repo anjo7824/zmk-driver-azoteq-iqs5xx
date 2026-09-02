@@ -576,9 +576,26 @@ static int iqs5xx_init(const struct device *dev) {
     k_msleep(100);
 
     // Setup device configuration.
-    ret = iqs5xx_setup_device(dev);
+    //
+    // Without reset-gpios we can't force the chip into a known state, so its
+    // own power-on/ATI sequence can still be finishing when we get here,
+    // causing the first I2C write to fail (NACK/timeout). Retry a few times
+    // before giving up, instead of leaving the chip on its previous/factory
+    // gesture configuration while we still process its interrupts.
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        ret = iqs5xx_setup_device(dev);
+        if (ret == 0) {
+            break;
+        }
+        LOG_WRN("Setup attempt %d/5 failed: %d", attempt, ret);
+        k_msleep(50);
+    }
     if (ret < 0) {
         LOG_ERR("Failed to setup device: %d", ret);
+        // The chip may be running with a gesture configuration we never
+        // managed to apply (its own previous state or factory defaults).
+        // Don't keep processing its interrupts against that unknown config.
+        gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_DISABLE);
         return ret;
     }
 
